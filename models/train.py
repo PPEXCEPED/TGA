@@ -6,22 +6,20 @@ from process import ImageFeature, FuseAllFeature, FinalClassifier, TextFeatureEm
 from process.DataSet import *
 from torch.utils.data import Dataset, DataLoader
 import os
-from visdom import Visdom
 import model
 import torch.nn.functional as F
-from sklearn.metrics import precision_score
-from sklearn.metrics import recall_score
-from sklearn.metrics import f1_score
-from tools.config import config
 
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cuda")
+from tools.config import config
+from models.model import Siamese, ContrastiveLoss, FeatureExtractor
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # loss = Visdom()
 # acc = Visdom()
 # loss.line([[0, 0]], [1], win='train_loss', opts=dict(title='loss', legend=['siamese_loss', 'domain_loss']))
 # acc.line([[0, 0]], [1], win='train_acc', opts=dict(title='acc', legend=['siamese_acc', 'domain_acc']))
-
+TEXT_HIDDEN = 256
 
 def to_np(x):
     return x.data.cpu().numpy()
@@ -65,11 +63,12 @@ class Multimodel_image_text_g(torch.nn.Module):
         self.final_classifier = FinalClassifier.ClassificationLayer(fc_dropout_rate, 512)
 
     def forward(self, image_feature, text_index):
-        image_result, image_seq = self.image(image_feature)
+        image_result, image_seq = self.image(image_feature, text_index)
         text_result, text_seq = self.text(text_index)
         fusion = self.fuse(image_result, image_seq, text_result, text_seq.permute(1, 0, 2))
         output = self.final_classifier(fusion)
         return output
+
 
 class text_g(torch.nn.Module):
     def __init__(self, lstm_dropout_rate, fc_dropout_rate):
@@ -86,6 +85,7 @@ class text_g(torch.nn.Module):
         output = self.final_classifier(fusion)
         return output
 
+
 class image_g(torch.nn.Module):
     def __init__(self, lstm_dropout_rate, fc_dropout_rate):
         super(image_g, self).__init__()
@@ -101,7 +101,9 @@ class image_g(torch.nn.Module):
         output = self.final_classifier(fusion)
         return output
 
-def train(model5, train_loader, val_loader, loss_fn, optimizer5, number_of_epoch, i, file):
+
+def train(model5, siamese, extractor, train_loader, val_loader, loss_fn, siamese_loss_fn, optimizer5, optimizer_siamese,
+          number_of_epoch, i, file):
     F1_old = 0
     TP = TN = FN = FP = 0
     F1_5 = 0
@@ -110,14 +112,16 @@ def train(model5, train_loader, val_loader, loss_fn, optimizer5, number_of_epoch
     for epoch in range(number_of_epoch):
 
         model5_train_loss = 0
-        cla_train_loss = 0
-        cla_correct_train = 0
+        sim_train_loss = 0
+        sim_correct_train = 0
         # for i in range(1,9):
         #     model_train_loss[i]=0
         #     model_correct_train[i] = 0
         #     eval('model'+str(i)+'.train()')
         model5_correct_train = 0
         model5.train()
+        # siamese.train()
+        # extractor.train()
 
         right_num = data_num = count = 0
         dict = {}
@@ -127,8 +131,20 @@ def train(model5, train_loader, val_loader, loss_fn, optimizer5, number_of_epoch
             data_num += train_loader.batch_size
             group = group.view(-1, 1).to(torch.float32).to(device)
             model5_pred = model5(image_feature.to(device), text_index.to(device))
+            # print("image_feature:{}".format(image_feature.shape))
+            text_feature, image_feature1 = extractor(text_index.to(device), image_feature.to(device))
+            # # print("image_feature1:{}".format(image_feature1.shape))
+            output1, output2 = siamese(text_feature, image_feature1)
+            distance = F.pairwise_distance(output1, output2)
+
+            for j in range(len(distance)):
+                if distance[j] > 0.65:
+                    model5_pred[j] = model5_pred[j] + 0.1 * distance[j]
+            # print(distance, model5_pred)
+            # exit(0)
 
             model5_loss = loss_fn(model5_pred, group)
+            # print(model5_loss)
             model5_train_loss += model5_loss
 
             model5_correct_train += (model5_pred.round() == group).sum().item()
@@ -136,8 +152,10 @@ def train(model5, train_loader, val_loader, loss_fn, optimizer5, number_of_epoch
             optimizer5.zero_grad()
 
             model5_loss.backward()
+            # sim_loss.backward(retain_graph=True)
 
             optimizer5.step()
+            # optimizer_siamese.step()
 
             def f1_score(TP, TN, FN, FP, model):
                 TP += ((model.round() == 1) & (group == 1)).cpu().sum().item()
@@ -199,7 +217,7 @@ def train(model5, train_loader, val_loader, loss_fn, optimizer5, number_of_epoch
         # 				[count], win='train_acc', update='append')
 
         # learning_rate adjustment
-        F1_new = test(model5, val_loader, file)
+        F1_new = test(model5, extractor, siamese, val_loader, file)
 
         # test(model1, model2, model3,  val_loader)
         if F1_new < F1_old:
@@ -222,7 +240,7 @@ def train(model5, train_loader, val_loader, loss_fn, optimizer5, number_of_epoch
         torch.save(state5, './model_sava/' + name + 'model5.pth')
 
 
-def test(model5, val_loader, file):
+def test(model5, extractor, siamese, val_loader, file):
     valid_loss5 = 0
 
     correct_valid5 = 0
@@ -242,12 +260,22 @@ def test(model5, val_loader, file):
             val_group = val_grad.view(-1, 1).to(torch.float32).to(device)
 
             model5_val_pred = model5(val_image_feature.to(device), val_text_index.to(device))
-            # right_num += (result.round() == val_group).sum().item()
+            text_feature, image_feature1 = extractor(val_text_index.to(device), val_image_feature.to(device))
+            # # print("image_feature1:{}".format(image_feature1.shape))
+            output1, output2 = siamese(text_feature, image_feature1)
+
             data_num += val_loader.batch_size
 
             val_loss5 = loss_fn(model5_val_pred, val_group)
 
+            distance = F.pairwise_distance(output1, output2)
+            for j in range(len(distance)):
+                if distance[j] > 0.65:
+                    model5_val_pred[j] = model5_val_pred[j] + 0.1 * distance[j]
+
             valid_loss5 += val_loss5
+
+            # valid_loss5 = valid_loss5 + 0.25 * distance
 
             correct_valid5 += (model5_val_pred.round() == val_group).sum().item()
 
@@ -354,6 +382,7 @@ if __name__ == "__main__":
             f"learning rate={learning_rate} | fc dropout={fc_dropout_rate} | lstm dropout={lstm_dropout_rate} | weight decay={weight_decay}")
         # loss function
         loss_fn = torch.nn.BCELoss()
+        siamese_loss_fn = ContrastiveLoss()
         # initilize the model
 
         model5 = Multimodel_image_text_g(lstm_dropout_rate, fc_dropout_rate).to(device)
@@ -362,7 +391,12 @@ if __name__ == "__main__":
         # 单模态 图像
         # model5 = image_g(lstm_dropout_rate, fc_dropout_rate).to(device)
         # optimizer
+        siamese = Siamese().to(device)
+        extractor = FeatureExtractor(lstm_dropout_rate).to(device)
+
+        optimizer_siamese = torch.optim.Adam(siamese.parameters(), lr=learning_rate, weight_decay=weight_decay)
         optimizer5 = torch.optim.Adam(model5.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        optimizer_extractor = torch.optim.Adam(extractor.parameters(), lr=learning_rate, weight_decay=weight_decay)
         name = 'model' + str(i) + "/"
         create_folder(name)
         file = open('./model_sava/' + name + 'r.txt', 'a')
@@ -372,10 +406,11 @@ if __name__ == "__main__":
             model_load(name)
 
         # train
-        number_of_epoch = 11
+        number_of_epoch = 15
         time_start = time.time()
-        train(model5, train_loader, test_loader, loss_fn,
-              optimizer5,
+        # print(i)
+        train(model5, siamese, extractor, train_loader, val_loader, loss_fn, siamese_loss_fn,
+              optimizer5, optimizer_siamese,
               number_of_epoch, i, file)
 
         i += 1
