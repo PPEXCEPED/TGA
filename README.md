@@ -1,7 +1,7 @@
 # TGA
 Multi-Modal Transformer for Fake News Detection
 
-![TGA1 (2) (2)](https://user-images.githubusercontent.com/88826349/220891892-6ccb101d-d430-44d6-bfb2-a924addd47d4.png)
+![TGA_](https://user-images.githubusercontent.com/88826349/228999984-27d6f4ee-04bd-4fd3-ae8f-273cdee34d57.png)
 
 
 ## Dataset-weibo
